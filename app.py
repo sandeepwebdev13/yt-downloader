@@ -1,65 +1,20 @@
 import os
-import sys
 import uuid
 import json
 import threading
-import urllib.request
-import zipfile
-import shutil
 from flask import Flask, render_template, request, jsonify, Response, send_file
 import yt_dlp
 
-# ---------- AUTO DOWNLOAD FFMPEG (Windows) ----------
-def ensure_ffmpeg():
-    """Check if ffmpeg is available; if not, download portable version to project folder."""
-    # First, check if already in PATH
-    if shutil.which("ffmpeg"):
-        return True
-
-    # Check if we already have it locally
-    local_ffmpeg = os.path.join(os.path.dirname(__file__), "ffmpeg.exe")
-    if os.path.exists(local_ffmpeg):
-        os.environ["PATH"] = os.path.dirname(local_ffmpeg) + os.pathsep + os.environ["PATH"]
-        return True
-
-    print("FFmpeg not found. Downloading portable version automatically...")
-    # Download from gyan.dev (trusted FFmpeg builds)
-    url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-    zip_path = os.path.join(os.path.dirname(__file__), "ffmpeg.zip")
-
-    try:
-        urllib.request.urlretrieve(url, zip_path)
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            # Find the bin folder inside the extracted zip
-            for member in zip_ref.namelist():
-                if member.endswith("ffmpeg.exe"):
-                    # Extract ffmpeg.exe to project root
-                    with zip_ref.open(member) as source, open(local_ffmpeg, "wb") as target:
-                        shutil.copyfileobj(source, target)
-                    break
-        os.remove(zip_path)
-        print("FFmpeg downloaded successfully.")
-        os.environ["PATH"] = os.path.dirname(local_ffmpeg) + os.pathsep + os.environ["PATH"]
-        return True
-    except Exception as e:
-        print(f"Auto-download failed: {e}")
-        print("You can manually place ffmpeg.exe in this folder or install FFmpeg globally.")
-        return False
-
-if not ensure_ffmpeg():
-    print("\n⚠️  Warning: FFmpeg could not be downloaded. Audio conversion may fail.")
-    print("   You can still download videos without audio merging.\n")
-
-# ---------- FLASK APP ----------
 app = Flask(__name__)
 app.config['DOWNLOAD_FOLDER'] = 'downloads'
 os.makedirs(app.config['DOWNLOAD_FOLDER'], exist_ok=True)
 
-# In‑memory store for download progress
+# In-memory store for download progress and metadata
 downloads = {}
 progress_hooks = {}
 
 def progress_hook(d):
+    """yt-dlp progress hook, updates global state."""
     if d['status'] == 'downloading':
         download_id = d['info_dict'].get('__download_id')
         if download_id:
@@ -81,6 +36,7 @@ def progress_hook(d):
                 downloads[download_id]['progress'] = 100
 
 def download_worker(download_id, url, format_choice):
+    """Background thread to handle the actual download."""
     try:
         ydl_opts = {
             'outtmpl': os.path.join(app.config['DOWNLOAD_FOLDER'], f'{download_id}_%(title)s.%(ext)s'),
@@ -114,8 +70,9 @@ def download_worker(download_id, url, format_choice):
             filename = ydl.prepare_filename(info)
             if format_choice == 'audio':
                 filename = filename.rsplit('.', 1)[0] + '.mp3'
-            elif not filename.endswith('.mp4'):
-                filename += '.mp4'
+            else:
+                if not filename.endswith('.mp4'):
+                    filename += '.mp4'
 
             downloads[download_id]['status'] = 'completed'
             downloads[download_id]['filename'] = os.path.basename(filename)
@@ -137,21 +94,30 @@ def get_info():
     url = data.get('url')
     if not url:
         return jsonify({'error': 'URL is required'}), 400
+
     try:
-        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+        ydl_opts = {'quiet': True, 'no_warnings': True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
+
             formats = []
-            seen = set()
+            seen_heights = set()
             for f in info.get('formats', []):
-                h = f.get('height')
-                if h and h not in seen and f.get('vcodec') != 'none':
-                    formats.append({'id': f"{h}p", 'label': f"{h}p", 'height': h})
-                    seen.add(h)
+                height = f.get('height')
+                if height and height not in seen_heights and f.get('vcodec') != 'none':
+                    formats.append({
+                        'id': f"{height}p",
+                        'label': f"{height}p",
+                        'height': height
+                    })
+                    seen_heights.add(height)
+
             formats.sort(key=lambda x: x['height'])
             formats.append({'id': 'audio', 'label': 'Audio (MP3)'})
+
             return jsonify({
-                'title': info.get('title'),
-                'thumbnail': info.get('thumbnail'),
+                'title': info.get('title', 'Unknown'),
+                'thumbnail': info.get('thumbnail', ''),
                 'duration': info.get('duration', 0),
                 'formats': formats
             })
@@ -162,43 +128,74 @@ def get_info():
 def start_download():
     data = request.get_json()
     url = data.get('url')
-    fmt = data.get('format')
-    if not url or not fmt:
-        return jsonify({'error': 'URL and format required'}), 400
+    format_choice = data.get('format')
+    if not url or not format_choice:
+        return jsonify({'error': 'URL and format are required'}), 400
+
     download_id = str(uuid.uuid4())
-    downloads[download_id] = {'status': 'starting', 'progress': 0}
+    downloads[download_id] = {
+        'status': 'starting',
+        'progress': 0,
+        'filename': None,
+        'error': None,
+    }
     progress_hooks[download_id] = {'status': 'starting', 'percent': 0}
-    threading.Thread(target=download_worker, args=(download_id, url, fmt)).start()
+
+    thread = threading.Thread(target=download_worker, args=(download_id, url, format_choice))
+    thread.start()
+
     return jsonify({'download_id': download_id})
 
 @app.route('/progress/<download_id>')
 def progress_stream(download_id):
     def generate():
         if download_id not in downloads:
-            yield f"data: {json.dumps({'error': 'Invalid ID'})}\n\n"
+            yield f"data: {json.dumps({'error': 'Invalid download ID'})}\n\n"
             return
-        last = -1
+
+        last_percent = -1
         while True:
-            hook = progress_hooks.get(download_id, {})
-            status = hook.get('status', downloads[download_id]['status'])
-            percent = hook.get('percent', 0)
-            if percent != last or status in ('completed', 'error'):
-                yield f"data: {json.dumps({'status': status, 'percent': percent, 'error': hook.get('error')})}\n\n"
-                last = percent
+            hook_data = progress_hooks.get(download_id, {})
+            status = hook_data.get('status', downloads[download_id]['status'])
+            percent = hook_data.get('percent', downloads[download_id]['progress'])
+
+            if percent != last_percent or status in ('completed', 'error'):
+                yield f"data: {json.dumps({'status': status, 'percent': percent, 'error': hook_data.get('error')})}\n\n"
+                last_percent = percent
+
             if status in ('completed', 'error'):
                 break
-            import time; time.sleep(0.5)
+
+            import time
+            time.sleep(0.5)
+
     return Response(generate(), mimetype='text/event-stream')
 
 @app.route('/file/<download_id>')
 def serve_file(download_id):
     if download_id not in downloads or downloads[download_id]['status'] != 'completed':
         return jsonify({'error': 'File not ready'}), 404
-    path = downloads[download_id]['filepath']
+
+    filepath = downloads[download_id]['filepath']
     title = downloads[download_id]['title']
-    ext = os.path.splitext(path)[1]
-    safe = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).rstrip()
-    return send_file(path, as_attachment=True, download_name=f"{safe}{ext}")
+    ext = os.path.splitext(filepath)[1]
+    safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).rstrip()
+    download_name = f"{safe_title}{ext}"
+
+    def cleanup():
+        try:
+            os.remove(filepath)
+            del downloads[download_id]
+            del progress_hooks[download_id]
+        except:
+            pass
+
+    return send_file(
+        filepath,
+        as_attachment=True,
+        download_name=download_name,
+    )
 
 if __name__ == '__main__':
-    app.run(debug=True, threaded=True)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(debug=False, host='0.0.0.0', port=port)
